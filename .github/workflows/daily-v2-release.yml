@@ -321,7 +321,8 @@ jobs:
       LAST_SHA: ${{ needs.check.outputs.last_sha }}
       DESKTOP: ${{ needs.check.outputs.desktop }}
       CLI: ${{ needs.check.outputs.cli }}
-      PRERELEASE: ${{ env.PRERELEASE }}
+      # PRERELEASE / UPSTREAM_REPO / UPSTREAM_BRANCH / OPENCODE_CHANNEL 由 workflow 级
+      # env 自动注入到每个步骤，无需在这里重复声明（env 上下文在 job 级 env 中不可用）。
     steps:
       - name: Download desktop assets
         uses: actions/download-artifact@v4

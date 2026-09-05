@@ -81,9 +81,11 @@ Linux runner 上用上游的 `packages/cli/script/build.ts` 交叉编译（与�
 Windows runner 上按上游 `publish.yml` 的 electron 流程：
 
 1. 把上一步的 CLI 产物放回 `packages/cli/dist`
-2. `bun ./scripts/prepare.ts`（内嵌 `opencode-cli.exe`、复制 prod 图标、写入版本号）
-3. `bun run build`（electron-vite）
-4. `npx electron-builder --win --x64 --publish never`
+2. **冒烟测试**：直接执行 Linux 交叉编译出来的 `opencode2.exe --version`，
+   确认二进制能在真 Windows 上运行且版本号与注入值一致（放在 `bun install` 之前，坏了能早退）
+3. `bun ./scripts/prepare.ts`（内嵌 `opencode-cli.exe`、复制 prod 图标、写入版本号）
+4. `bun run build`（electron-vite）
+5. `npx electron-builder --win --x64 --publish never`
 
 产物：`opencode-desktop-win-x64.exe`（NSIS 安装程序，约 200 MB）+ `.blockmap`。
 注意 electron-builder 的 `${os}` 在 Windows 下展开为 `win` 而非 `windows`，所以文件名是 `win-x64`。
@@ -96,6 +98,25 @@ Windows runner 上按上游 `publish.yml` 的 electron 流程：
 ### 5. `sync-version` — 同步
 
 把本轮的上游 commit、版本串、Release 链接写回 `version.json` 并提交推送。
+
+## 实测记录（2026-09-05，ming-14/OpenCodev2-Release）
+
+| Run | 触发 | 结果 | 验证了什么 |
+| --- | --- | --- | --- |
+| #1 | push | failure | workflow 解析失败：job 级 `env:` 里用了 `env` 上下文（只有 step 级可用） |
+| #2 | dispatch | **success** | 首次构建全链路：12 目标交叉编译 → Windows 打包 → 5 个资产上传 → `version.json` 回写 |
+| #3 | dispatch | **success** | 跳过路径：`decision: 上游无新提交` → 下游 4 个任务全 skipped，无重复 Release |
+| #4 | dispatch `force` | **success** | force 无视节流 + tag 撞车退化出 `v2-20260905-7a4ad68.4` + CLI 冒烟测试 |
+
+关键实测数据：
+
+- `check` ~40 秒；`build-cli` ~3 分钟；`build-desktop` ~13 分钟；全程 ~17 分钟。
+- 上游 `setup-bun` 复合 action 在跨仓库 checkout 下可正常引用（`uses: ./.github/actions/setup-bun`）。
+- 注入确认：`{"channel":"prod","version":"0.0.0-v2.20260905.7a4ad68"}`、桌面版 `Updated package.json version to …`。
+- 交叉编译的 Windows 二进制在真 Windows runner 上运行：
+  `actual=[opencode2 v0.0.0-v2.20260905.7a4ad68.4]`（单文件 210 MB）。
+- 未签名构建可行：`Skipping Windows signing because Azure Artifact Signing is not configured`，electron-builder 正常出包。
+- 产物：桌面版 202 MB + blockmap，三个终端版 zip 各 88–93 MB，一轮 Release 约 475 MB。
 
 ## 可调项（都在 workflow 顶部的 `env`）
 

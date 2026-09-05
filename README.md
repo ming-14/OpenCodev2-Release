@@ -85,7 +85,8 @@ Windows runner 上按上游 `publish.yml` 的 electron 流程：
 3. `bun run build`（electron-vite）
 4. `npx electron-builder --win --x64 --publish never`
 
-产物：`opencode-desktop-windows-x64.exe`（NSIS 安装程序）+ `.blockmap`。
+产物：`opencode-desktop-win-x64.exe`（NSIS 安装程序，约 200 MB）+ `.blockmap`。
+注意 electron-builder 的 `${os}` 在 Windows 下展开为 `win` 而非 `windows`，所以文件名是 `win-x64`。
 
 ### 4. `release` — 发布
 
@@ -119,10 +120,13 @@ Windows runner 上按上游 `publish.yml` 的 electron 流程：
 - **只构建 Windows x64 桌面版。** 需要 macOS / Linux 或 Windows ARM64，
   参照上游 `publish.yml` 的 `build-electron` matrix 增加条目即可
   （macOS 还需加 `--config.mac.identity=null --config.mac.notarize=false` 才能免签名构建）。
-- **单次构建约 20–40 分钟**，大头是 monorepo 的 `bun install` 和 CLI 的 12 目标交叉编译。
-  上游用的是 blacksmith 加速 runner（`blacksmith-4vcpu-*`），本仓库改用官方 `ubuntu-latest` / `windows-latest`，
-  公开仓库有免费额度；私有仓库按 7 天间隔算，每月约 4–5 轮 ≈ 100–200 分钟，
-  另外每天一次的 `check` 只是几个 API 调用，几十秒，基本不消耗额度。
+- **实测全程约 17 分钟**（2026-09-05 首次运行）：`check` ~40 秒、`build-cli` ~3 分钟（12 目标交叉编译比预想快得多）、
+  `build-desktop` ~13 分钟（大头是 Windows 上的 monorepo `bun install`）、`release` + `sync-version` ~1 分钟。
+  上游用的是 blacksmith 加速 runner（`blacksmith-4vcpu-*`），本仓库改用官方 `ubuntu-latest` / `windows-latest`。
+  公开仓库 Actions 不限量；私有仓库按 7 天间隔算每月约 4–5 轮 ≈ 90 分钟，
+  每天一次的 `check` 只是几个 API 调用，基本不消耗额度。
+- **产物体积不小**：桌面版安装程序约 200 MB，三个终端版 zip 各约 88–93 MB（Bun 把运行时整个打进单文件），
+  一轮 Release 约 475 MB。
 - **每个 Release 覆盖 7 天的上游变更**，不是「最新」构建。上游 `v2` 工作日通常有 5–15 个 commit，
   所以一轮 Release 的正文里一般会列出几十条变更。需要更及时就把 `MIN_INTERVAL_DAYS` 调小，
   设 `0` 即回到「每天有新提交就发一次」。

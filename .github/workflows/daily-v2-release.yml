@@ -362,7 +362,7 @@ jobs:
             echo
             echo "| 文件 | 说明 |"
             echo "| --- | --- |"
-            echo "| \`opencode-desktop-windows-x64.exe\` | 桌面版安装程序（Windows x64，未签名） |"
+            echo "| \`opencode-desktop-win-x64.exe\` | 桌面版安装程序（Windows x64，未签名） |"
             echo "| \`opencode-cli-windows-x64.zip\` | 终端版（x64） |"
             echo "| \`opencode-cli-windows-x64-baseline.zip\` | 终端版（x64，无 AVX2 的老 CPU） |"
             echo "| \`opencode-cli-windows-arm64.zip\` | 终端版（ARM64） |"

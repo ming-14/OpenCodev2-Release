@@ -1,0 +1,462 @@
+name: daily-v2-release
+
+run-name: "opencode v2 mirror · run #${{ github.run_number}}"
+
+# 每天检查上游 anomalyco/opencode 的 v2 分支，若 HEAD commit 前进且距上次发布已满
+# MIN_INTERVAL_DAYS（默认 7 天），就从该 commit 编译 Windows 桌面版 + Windows 终端版，
+# 发布到本仓库 Release（tag 形如 v2-20260905-7a4ad68），
+# 并把 commit 与时间写回 version.json 作为下一轮的比对基准。
+
+on:
+  schedule:
+    # UTC 00:00 = 北京时间 08:00
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "忽略版本号比对，强制重新构建并发布"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-v2-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: anomalyco/opencode
+  UPSTREAM_BRANCH: v2
+  # 与上游 .github/workflows/publish.yml 保持一致：编译进产物的 Bun 运行时版本
+  BUN_VERSION: "1.4.2"
+  BUN_COMPILE_RELEASE: bun-v1.4.2
+  # prod → 桌面版 productName 为 "OpenCode"、appId 为 ai.opencode.desktop
+  # 可改为 beta（"OpenCode Beta"）以避开与官方安装版的标识冲突
+  OPENCODE_CHANNEL: prod
+  # 每日镜像标记为预发布；改成 "false" 可让 GitHub 把最新一次构建显示为 Latest
+  PRERELEASE: "true"
+  # 距上次成功发布的最小间隔（天）。cron 仍每天跑，但未满间隔就跳过，
+  # 于是 Release 落在「满 7 天的那一天」，而不是固定在某个星期几。
+  MIN_INTERVAL_DAYS: "7"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # 1. 检查上游 v2 的 HEAD commit 是否前进，决定本轮是否构建
+  # ─────────────────────────────────────────────────────────────
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.probe.outputs.changed }}
+      version: ${{ steps.probe.outputs.version }}
+      tag: ${{ steps.probe.outputs.tag }}
+      stamp: ${{ steps.probe.outputs.stamp }}
+      short_sha: ${{ steps.probe.outputs.short_sha }}
+      desktop: ${{ steps.probe.outputs.desktop }}
+      cli: ${{ steps.probe.outputs.cli }}
+      sha: ${{ steps.probe.outputs.sha }}
+      last_sha: ${{ steps.probe.outputs.last_sha }}
+      age_days: ${{ steps.probe.outputs.age_days }}
+      reason: ${{ steps.probe.outputs.reason }}
+    steps:
+      - name: Checkout (读取本仓库 version.json)
+        uses: actions/checkout@v4
+
+      - name: Probe upstream v2
+        id: probe
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          pkgver() {
+            gh api -H "Accept: application/vnd.github.raw+json" \
+              "repos/$UPSTREAM_REPO/contents/$1?ref=$UPSTREAM_BRANCH" --jq .version
+          }
+
+          HEAD="$(gh api "repos/$UPSTREAM_REPO/commits/$UPSTREAM_BRANCH")"
+          SHA="$(jq -r .sha <<<"$HEAD")"
+          # 用 commit 时间而不是构建时间：同一 commit 重跑得到同一个 tag，可复现
+          STAMP="$(jq -r .commit.committer.date <<<"$HEAD" | cut -c1-10 | tr -d '-')"
+          SHORT="${SHA:0:7}"
+          # 仅作展示信息：v2 分支上这两个号长期不同步，也不参与判定
+          DESKTOP="$(pkgver packages/desktop/package.json)"
+          CLI="$(pkgver packages/cli/package.json)"
+
+          LAST_SHA="" LAST_UPDATED=""
+          if [ -f version.json ]; then
+            LAST_SHA="$(jq -r '.commit // ""' version.json)"
+            LAST_UPDATED="$(jq -r '.updated_at // ""' version.json)"
+          fi
+
+          LAST_SHORT="${LAST_SHA:0:7}"
+
+          echo "upstream : $UPSTREAM_BRANCH @ $SHORT ($STAMP)  desktop=$DESKTOP cli=$CLI"
+          echo "recorded : ${LAST_SHORT:-<none>}  built at ${LAST_UPDATED:-<never>}"
+
+          # 距上次成功发布的最小间隔节流；锚点是 version.json 的 updated_at（发布成功时才写）
+          AGE_DAYS=""
+          if [ -n "$LAST_UPDATED" ]; then
+            LAST_EPOCH="$(date -u -d "$LAST_UPDATED" +%s 2>/dev/null || true)"
+            if [ -n "$LAST_EPOCH" ]; then
+              NOW_EPOCH="$(date -u +%s)"
+              AGE_DAYS=$(( (NOW_EPOCH - LAST_EPOCH) / 86400 ))
+            fi
+          fi
+
+          CHANGED=false REASON=""
+          if [ "$FORCE" = "true" ]; then
+            CHANGED=true
+            REASON="手动 force，忽略间隔节流"
+          elif [ -z "$LAST_SHA" ]; then
+            CHANGED=true
+            REASON="首次构建"
+          elif [ "$SHA" = "$LAST_SHA" ]; then
+            REASON="上游无新提交"
+          elif [ -n "$AGE_DAYS" ] && [ "$AGE_DAYS" -lt "$MIN_INTERVAL_DAYS" ]; then
+            REASON="有 $AGE_DAYS 天前的新提交，但未达 $MIN_INTERVAL_DAYS 天间隔"
+          else
+            CHANGED=true
+            REASON="上游有新提交${AGE_DAYS:+，距上次发布已 $AGE_DAYS 天}"
+          fi
+
+          echo "decision : $REASON"
+
+          VERSION="" TAG=""
+          if [ "$CHANGED" = "true" ]; then
+            # TAG 给人看；VERSION 要写进 package.json / 烧进二进制，必须是合法 semver。
+            TAG="$UPSTREAM_BRANCH-$STAMP-$SHORT"
+            VERSION="0.0.0-$UPSTREAM_BRANCH.$STAMP.$SHORT"
+            # 同一 commit 同一天重复发布（一般是 force）时追加运行编号避免撞车
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              TAG="$TAG.$GITHUB_RUN_NUMBER"
+              VERSION="$VERSION.$GITHUB_RUN_NUMBER"
+            fi
+          fi
+
+          {
+            echo "changed=$CHANGED"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "stamp=$STAMP"
+            echo "short_sha=$SHORT"
+            echo "desktop=$DESKTOP"
+            echo "cli=$CLI"
+            echo "sha=$SHA"
+            echo "last_sha=$LAST_SHA"
+            echo "age_days=$AGE_DAYS"
+            echo "reason=$REASON"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### opencode \`$UPSTREAM_BRANCH\` 检查"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游 commit | \`$SHORT\` |"
+            echo "| 已构建 commit | \`${LAST_SHORT:-—}\` |"
+            echo "| 距上次发布 | ${AGE_DAYS:-—} 天（最小间隔 $MIN_INTERVAL_DAYS 天） |"
+            echo "| 上游 package.json | desktop \`$DESKTOP\` / cli \`$CLI\` |"
+            echo ""
+            if [ "$CHANGED" = "true" ]; then
+              echo "**$REASON → 构建并发布 \`$TAG\`**（版本串 \`$VERSION\`）"
+            else
+              echo "**$REASON → 跳过本轮构建**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Skip notice
+        if: steps.probe.outputs.changed != 'true'
+        run: echo "::notice::${{ steps.probe.outputs.reason }}，后续构建任务全部跳过。"
+  # ─────────────────────────────────────────────────────────────
+  # 2. 终端版（CLI）：在 Linux 上用 Bun 交叉编译全部 Windows 目标
+  # ─────────────────────────────────────────────────────────────
+  build-cli:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: anomalyco/opencode
+          ref: ${{ needs.check.outputs.sha }}
+          fetch-depth: 1
+
+      - name: Setup Bun + install
+        uses: ./.github/actions/setup-bun
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Build CLI
+        run: bun ./packages/cli/script/build.ts
+        env:
+          BUN_COMPILE_RELEASE: ${{ env.BUN_COMPILE_RELEASE }}
+          OPENCODE_VERSION: ${{ needs.check.outputs.version }}
+          OPENCODE_CHANNEL: ${{ env.OPENCODE_CHANNEL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Archive Windows CLI builds
+        run: |
+          set -euo pipefail
+          cd packages/cli/dist
+          found=0
+          for dir in cli-windows-*; do
+            [ -d "$dir" ] || continue
+            found=1
+            ( cd "$dir" && zip -qr "$OLDPWD/opencode-$dir.zip" . )
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "no cli-windows-* artifacts produced" >&2
+            exit 1
+          fi
+          ls -l opencode-cli-windows-*.zip
+
+      - name: Upload CLI builds (供桌面版打包内嵌使用)
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-cli-windows-dirs
+          path: packages/cli/dist/cli-windows-*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload CLI archives (release 资产)
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-cli-windows-zips
+          path: packages/cli/dist/opencode-cli-windows-*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────
+  # 3. 桌面版（Electron）：Windows x64，未签名
+  # ─────────────────────────────────────────────────────────────
+  build-desktop:
+    needs: [check, build-cli]
+    if: needs.check.outputs.changed == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: anomalyco/opencode
+          ref: ${{ needs.check.outputs.sha }}
+          fetch-depth: 1
+
+      - name: Restore CLI builds
+        uses: actions/download-artifact@v4
+        with:
+          name: opencode-cli-windows-dirs
+          path: packages/cli/dist
+
+      - name: Setup Bun + install
+        uses: ./.github/actions/setup-bun
+
+      - name: Prepare (内嵌 CLI、图标、版本号)
+        working-directory: packages/desktop
+        run: bun ./scripts/prepare.ts
+        env:
+          OPENCODE_VERSION: ${{ needs.check.outputs.version }}
+          OPENCODE_CHANNEL: ${{ env.OPENCODE_CHANNEL }}
+          OPENCODE_CLI_TARGET: x86_64-pc-windows-msvc
+          OPENCODE_CLI_DIST: ${{ github.workspace }}/packages/cli/dist
+
+      - name: Build renderer/main
+        working-directory: packages/desktop
+        run: bun run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+          OPENCODE_VERSION: ${{ needs.check.outputs.version }}
+          OPENCODE_CHANNEL: ${{ env.OPENCODE_CHANNEL }}
+          OPENCODE_CLI_TARGET: x86_64-pc-windows-msvc
+          OPENCODE_CLI_DIST: ${{ github.workspace }}/packages/cli/dist
+
+      - name: Package with electron-builder
+        working-directory: packages/desktop
+        run: npx electron-builder --win --x64 --publish never --config electron-builder.config.ts
+        timeout-minutes: 60
+        env:
+          OPENCODE_CHANNEL: ${{ env.OPENCODE_CHANNEL }}
+
+      - name: Upload desktop installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-desktop-windows
+          path: |
+            packages/desktop/dist/*.exe
+            packages/desktop/dist/*.blockmap
+          if-no-files-found: error
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────
+  # 4. 发布 GitHub Release
+  # ─────────────────────────────────────────────────────────────
+  release:
+    needs: [check, build-cli, build-desktop]
+    if: >-
+      always() &&
+      needs.check.result == 'success' &&
+      needs.check.outputs.changed == 'true' &&
+      needs.build-cli.result == 'success' &&
+      needs.build-desktop.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 本任务不 checkout，gh 需要显式的仓库上下文
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
+      SHA: ${{ needs.check.outputs.sha }}
+      SHORT: ${{ needs.check.outputs.short_sha }}
+      STAMP: ${{ needs.check.outputs.stamp }}
+      LAST_SHA: ${{ needs.check.outputs.last_sha }}
+      DESKTOP: ${{ needs.check.outputs.desktop }}
+      CLI: ${{ needs.check.outputs.cli }}
+      PRERELEASE: ${{ env.PRERELEASE }}
+    steps:
+      - name: Download desktop assets
+        uses: actions/download-artifact@v4
+        with:
+          name: opencode-desktop-windows
+          path: assets/desktop
+
+      - name: Download CLI assets
+        uses: actions/download-artifact@v4
+        with:
+          name: opencode-cli-windows-zips
+          path: assets/cli
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+
+          COMMITS=""
+          if [ -n "$LAST_SHA" ] && [ "$LAST_SHA" != "$SHA" ]; then
+            COMMITS="$(gh api "repos/$UPSTREAM_REPO/compare/$LAST_SHA...$SHA" \
+              --jq '.commits[] | "• `" + (.sha[0:7]) + "` " + (.commit.message | split("\n")[0])' 2>/dev/null || true)"
+          fi
+          if [ -z "$COMMITS" ]; then
+            COMMITS="$(gh api "repos/$UPSTREAM_REPO/commits?sha=$UPSTREAM_BRANCH&per_page=30" \
+              --jq '.[] | "• `" + (.sha[0:7]) + "` " + (.commit.message | split("\n")[0])')"
+          fi
+
+          {
+            echo "每日定时任务从 [\`$UPSTREAM_REPO@$UPSTREAM_BRANCH\`](https://github.com/$UPSTREAM_REPO/tree/$UPSTREAM_BRANCH) 的最新提交自动构建。"
+            echo
+            echo "- 上游 commit：[\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA)"
+            echo "- 产物版本串：\`$VERSION\`"
+            echo "- 上游 package.json：desktop \`$DESKTOP\` / cli \`$CLI\`（仅作参考，v2 分支上这两个号不同步）"
+            echo "- 构建通道：\`$OPENCODE_CHANNEL\`"
+            echo
+            echo "### 产物"
+            echo
+            echo "| 文件 | 说明 |"
+            echo "| --- | --- |"
+            echo "| \`opencode-desktop-windows-x64.exe\` | 桌面版安装程序（Windows x64，未签名） |"
+            echo "| \`opencode-cli-windows-x64.zip\` | 终端版（x64） |"
+            echo "| \`opencode-cli-windows-x64-baseline.zip\` | 终端版（x64，无 AVX2 的老 CPU） |"
+            echo "| \`opencode-cli-windows-arm64.zip\` | 终端版（ARM64） |"
+            echo
+            echo "> 终端版解压后得到 \`bin/opencode2.exe\`，命令名为 \`opencode2\`。"
+            echo
+            echo "### 上游变更"
+            echo
+            echo "$COMMITS"
+          } > notes.md
+          cat notes.md
+
+      - name: Create release
+        run: |
+          set -euo pipefail
+          if [ "$PRERELEASE" = "true" ]; then
+            FLAG="--prerelease"
+          else
+            FLAG="--latest"
+          fi
+          # 不传 --target：本仓库不包含上游 commit，标签应指向本仓库当前提交
+          gh release create "$TAG" \
+            $FLAG \
+            --title "OpenCode $UPSTREAM_BRANCH · ${STAMP:0:4}-${STAMP:4:2}-${STAMP:6:2} · $SHORT" \
+            --notes-file notes.md \
+            assets/desktop/* \
+            assets/cli/*.zip
+
+      - name: Summary
+        run: |
+          {
+            echo "### ✅ 已发布 \`$TAG\`"
+            echo
+            echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+            echo
+            echo '```'
+            gh release view "$TAG" --json assets --jq '.assets[].name'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────────────────────
+  # 5. 同步版本号：把本轮版本号写回本仓库 version.json
+  # ─────────────────────────────────────────────────────────────
+  sync-version:
+    needs: [check, release]
+    if: always() && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
+      SHA: ${{ needs.check.outputs.sha }}
+      DESKTOP: ${{ needs.check.outputs.desktop }}
+      CLI: ${{ needs.check.outputs.cli }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Update version.json
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg upstream "$UPSTREAM_REPO" \
+            --arg branch "$UPSTREAM_BRANCH" \
+            --arg desktop "$DESKTOP" \
+            --arg cli "$CLI" \
+            --arg commit "$SHA" \
+            --arg version "$VERSION" \
+            --arg tag "$TAG" \
+            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" \
+            --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              upstream: $upstream,
+              branch: $branch,
+              desktop_version: $desktop,
+              cli_version: $cli,
+              commit: $commit,
+              version: $version,
+              release_tag: $tag,
+              release_url: $url,
+              updated_at: $updated
+            }' > version.json
+          cat version.json
+
+      - name: Commit & push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          if git diff --cached --quiet; then
+            echo "version.json 无变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore: sync v2 version to $TAG [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}"

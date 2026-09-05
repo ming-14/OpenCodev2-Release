@@ -1,0 +1,5 @@
+# 本地参考用的上游源码 checkout，不入库
+参考/
+
+node_modules/
+.DS_Store

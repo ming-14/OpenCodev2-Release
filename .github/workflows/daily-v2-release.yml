@@ -257,6 +257,25 @@ jobs:
           name: opencode-cli-windows-dirs
           path: packages/cli/dist
 
+      # CLI 是在 Linux 上用 Bun 交叉编译出来的，这里在真正的 Windows 上跑一次，
+      # 确认二进制能执行且烧进去的版本号正确 —— 放在 bun install 之前，坏了能早退。
+      - name: Smoke test cross-compiled CLI
+        env:
+          EXPECTED_VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          exe=./packages/cli/dist/cli-windows-x64/bin/opencode2.exe
+          ls -l "$exe"
+          actual="$(timeout 180 "$exe" --version | tr -d '\r\n')"
+          echo "actual=[$actual]  expected=[$EXPECTED_VERSION]"
+          case "$actual" in
+            *"$EXPECTED_VERSION"*) echo "CLI version OK" ;;
+            *)
+              echo "::error::交叉编译的 CLI 版本号不匹配：实际 [$actual] 期望 [$EXPECTED_VERSION]"
+              exit 1
+              ;;
+          esac
+
       - name: Setup Bun + install
         uses: ./.github/actions/setup-bun
 

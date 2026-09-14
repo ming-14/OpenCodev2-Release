@@ -264,7 +264,14 @@ jobs:
           EXPECTED_VERSION: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
-          exe=./packages/cli/dist/cli-windows-x64/bin/opencode2.exe
+          # 上游 bb564f9 (2026-09-11) 把命令名从 opencode2 改为 opencode，
+          # 不再硬编码文件名：自动探测 bin/ 下第一个 .exe，再校验烧进去的版本号。
+          exe="$(find ./packages/cli/dist/cli-windows-x64/bin -maxdepth 1 -name '*.exe' | head -n1)"
+          if [ -z "$exe" ]; then
+            echo "::error::cli-windows-x64/bin 下未找到任何 .exe 可执行文件"
+            ls -laR ./packages/cli/dist/cli-windows-x64 || true
+            exit 1
+          fi
           ls -l "$exe"
           actual="$(timeout 180 "$exe" --version | tr -d '\r\n')"
           echo "actual=[$actual]  expected=[$EXPECTED_VERSION]"
@@ -386,7 +393,7 @@ jobs:
             echo "| \`opencode-cli-windows-x64-baseline.zip\` | 终端版（x64，无 AVX2 的老 CPU） |"
             echo "| \`opencode-cli-windows-arm64.zip\` | 终端版（ARM64） |"
             echo
-            echo "> 终端版解压后得到 \`bin/opencode2.exe\`，命令名为 \`opencode2\`。"
+            echo "> 终端版解压后得到 \`bin/opencode.exe\`，命令名为 \`opencode\`（上游自 2026-09-11 的 \`bb564f9\` 起由 \`opencode2\` 改名）。"
             echo
             echo "### 上游变更"
             echo
